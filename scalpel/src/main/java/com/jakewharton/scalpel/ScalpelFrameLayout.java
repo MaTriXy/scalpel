@@ -1,24 +1,31 @@
 package com.jakewharton.scalpel;
 
 import android.content.Context;
+import android.content.res.Resources;
 import android.content.res.Resources.NotFoundException;
 import android.graphics.Camera;
 import android.graphics.Canvas;
 import android.graphics.Matrix;
 import android.graphics.Paint;
 import android.graphics.Rect;
+import android.graphics.Typeface;
+import android.os.Build;
 import android.util.AttributeSet;
 import android.util.Log;
+import android.util.SparseArray;
 import android.view.MotionEvent;
 import android.view.View;
 import android.view.ViewConfiguration;
 import android.view.ViewGroup;
 import android.widget.FrameLayout;
 import java.util.ArrayDeque;
+import java.util.BitSet;
 import java.util.Deque;
 
 import static android.graphics.Paint.ANTI_ALIAS_FLAG;
 import static android.graphics.Paint.Style.STROKE;
+import static android.graphics.Typeface.NORMAL;
+import static android.os.Build.VERSION_CODES.JELLY_BEAN;
 import static android.view.MotionEvent.ACTION_DOWN;
 import static android.view.MotionEvent.ACTION_POINTER_UP;
 import static android.view.MotionEvent.INVALID_POINTER_ID;
@@ -47,21 +54,30 @@ public class ScalpelFrameLayout extends FrameLayout {
   private static final int SPACING_DEFAULT = 25;
   private static final int SPACING_MIN = 10;
   private static final int SPACING_MAX = 100;
-  private static final int BORDER_COLOR = 0xFF888888;
+  private static final int CHROME_COLOR = 0xFF888888;
+  private static final int CHROME_SHADOW_COLOR = 0xFF000000;
+  private static final int TEXT_OFFSET_DP = 2;
+  private static final int TEXT_SIZE_DP = 10;
+  private static final int CHILD_COUNT_ESTIMATION = 25;
   private static final boolean DEBUG = false;
-
-  private static class LayeredView {
-    final View view;
-    final int layer;
-
-    LayeredView(View v, int l) {
-      view = v;
-      layer = l;
-    }
-  }
 
   private static void log(String message, Object... args) {
     Log.d("Scalpel", String.format(message, args));
+  }
+
+  private static class LayeredView {
+    View view;
+    int layer;
+
+    void set(View view, int layer) {
+      this.view = view;
+      this.layer = layer;
+    }
+
+    void clear() {
+      view = null;
+      layer = -1;
+    }
   }
 
   private final Rect viewBoundsRect = new Rect();
@@ -69,14 +85,24 @@ public class ScalpelFrameLayout extends FrameLayout {
   private final Camera camera = new Camera();
   private final Matrix matrix = new Matrix();
   private final int[] location = new int[2];
+  private final BitSet visibilities = new BitSet(CHILD_COUNT_ESTIMATION);
+  private final SparseArray<String> idNames = new SparseArray<>();
   private final Deque<LayeredView> layeredViewQueue = new ArrayDeque<>();
+  private final Pool<LayeredView> layeredViewPool = new Pool<LayeredView>(CHILD_COUNT_ESTIMATION) {
+    @Override protected LayeredView newObject() {
+      return new LayeredView();
+    }
+  };
 
+  private final Resources res;
   private final float density;
   private final float slop;
+  private final float textOffset;
+  private final float textSize;
 
   private boolean enabled;
   private boolean drawViews = true;
-  private boolean drawIds = false;
+  private boolean drawIds;
 
   private int pointerOne = INVALID_POINTER_ID;
   private float lastOneX;
@@ -91,7 +117,8 @@ public class ScalpelFrameLayout extends FrameLayout {
   private float zoom = ZOOM_DEFAULT;
   private float spacing = SPACING_DEFAULT;
 
-  private int[] visibilities = new int[50];
+  private int chromeColor;
+  private int chromeShadowColor;
 
   public ScalpelFrameLayout(Context context) {
     this(context, null);
@@ -103,11 +130,48 @@ public class ScalpelFrameLayout extends FrameLayout {
 
   public ScalpelFrameLayout(Context context, AttributeSet attrs, int defStyle) {
     super(context, attrs, defStyle);
+    res = context.getResources();
     density = context.getResources().getDisplayMetrics().density;
     slop = ViewConfiguration.get(context).getScaledTouchSlop();
 
-    viewBorderPaint.setColor(BORDER_COLOR);
+    textSize = TEXT_SIZE_DP * density;
+    textOffset = TEXT_OFFSET_DP * density;
+
+    setChromeColor(CHROME_COLOR);
     viewBorderPaint.setStyle(STROKE);
+    viewBorderPaint.setTextSize(textSize);
+    setChromeShadowColor(CHROME_SHADOW_COLOR);
+    if (Build.VERSION.SDK_INT >= JELLY_BEAN) {
+      viewBorderPaint.setTypeface(Typeface.create("sans-serif-condensed", NORMAL));
+    }
+  }
+
+  /** Set the view border chrome color. */
+  public void setChromeColor(int color) {
+    if (chromeColor != color) {
+      viewBorderPaint.setColor(color);
+      chromeColor = color;
+      invalidate();
+    }
+  }
+
+  /** Get the view border chrome color. */
+  public int getChromeColor() {
+    return chromeColor;
+  }
+
+  /** Set the view border chrome shadow color. */
+  public void setChromeShadowColor(int color) {
+    if (chromeShadowColor != color) {
+      viewBorderPaint.setShadowLayer(1, -1, 1, color);
+      chromeShadowColor = color;
+      invalidate();
+    }
+  }
+
+  /** Get the view border chrome shadow color. */
+  public int getChromeShadowColor() {
+    return chromeShadowColor;
   }
 
   /** Set whether or not the 3D view layer interaction is enabled. */
@@ -316,12 +380,14 @@ public class ScalpelFrameLayout extends FrameLayout {
     canvas.scale(zoom, zoom, cx, cy);
 
     if (!layeredViewQueue.isEmpty()) {
-      throw new AssertionError("Queues are not empty.");
+      throw new AssertionError("View queue is not empty.");
     }
 
     // We don't want to be rendered so seed the queue with our children.
     for (int i = 0, count = getChildCount(); i < count; i++) {
-      layeredViewQueue.add(new LayeredView(getChildAt(i), 0));
+      LayeredView layeredView = layeredViewPool.obtain();
+      layeredView.set(getChildAt(i), 0);
+      layeredViewQueue.add(layeredView);
     }
 
     while (!layeredViewQueue.isEmpty()) {
@@ -329,19 +395,21 @@ public class ScalpelFrameLayout extends FrameLayout {
       View view = layeredView.view;
       int layer = layeredView.layer;
 
-      // Hide any children.
+      // Restore the object to the pool for use later.
+      layeredView.clear();
+      layeredViewPool.restore(layeredView);
+
+      // Hide any visible children.
       if (view instanceof ViewGroup) {
         ViewGroup viewGroup = (ViewGroup) view;
-        int count = viewGroup.getChildCount();
-        if (count > visibilities.length) {
-          visibilities = new int[count];
-          if (DEBUG) log("Grow visibilities array to %s.", count);
-        }
-        for (int i = 0; i < count; i++) {
+        visibilities.clear();
+        for (int i = 0, count = viewGroup.getChildCount(); i < count; i++) {
           View child = viewGroup.getChildAt(i);
           //noinspection ConstantConditions
-          visibilities[i] = child.getVisibility();
-          child.setVisibility(INVISIBLE);
+          if (child.getVisibility() == VISIBLE) {
+            visibilities.set(i);
+            child.setVisibility(INVISIBLE);
+          }
         }
       }
 
@@ -364,32 +432,65 @@ public class ScalpelFrameLayout extends FrameLayout {
         view.draw(canvas);
       }
 
-      if (drawIds && view.getId() != NO_ID) {
-        try {
-          String name = getResources().getResourceEntryName(view.getId());
-          canvas.drawText(name, 5, 15, viewBorderPaint);
-        } catch (NotFoundException e) {
-          throw new AssertionError(e);
+      if (drawIds) {
+        int id = view.getId();
+        if (id != NO_ID) {
+          canvas.drawText(nameForId(id), textOffset, textSize, viewBorderPaint);
         }
       }
 
       canvas.restoreToCount(viewSaveCount);
 
-      // Restore any children and queue any visible ones for later drawing.
+      // Restore any hidden children and queue them for later drawing.
       if (view instanceof ViewGroup) {
         ViewGroup viewGroup = (ViewGroup) view;
         for (int i = 0, count = viewGroup.getChildCount(); i < count; i++) {
-          View child = viewGroup.getChildAt(i);
-          int newVisibility = visibilities[i];
-          //noinspection ConstantConditions,MagicConstant
-          child.setVisibility(newVisibility);
-          if (newVisibility == VISIBLE) {
-            layeredViewQueue.addLast(new LayeredView(child, layer + 1));
+          if (visibilities.get(i)) {
+            View child = viewGroup.getChildAt(i);
+            //noinspection ConstantConditions
+            child.setVisibility(VISIBLE);
+            LayeredView childLayeredView = layeredViewPool.obtain();
+            childLayeredView.set(child, layer + 1);
+            layeredViewQueue.add(childLayeredView);
           }
         }
       }
     }
 
     canvas.restoreToCount(saveCount);
+  }
+
+  private String nameForId(int id) {
+    String name = idNames.get(id);
+    if (name == null) {
+      try {
+        name = res.getResourceEntryName(id);
+      } catch (NotFoundException e) {
+        name = String.format("0x%8x", id);
+      }
+      idNames.put(id, name);
+    }
+    return name;
+  }
+
+  private static abstract class Pool<T> {
+    private final Deque<T> pool;
+
+    Pool(int initialSize) {
+      pool = new ArrayDeque<>(initialSize);
+      for (int i = 0; i < initialSize; i++) {
+        pool.addLast(newObject());
+      }
+    }
+
+    T obtain() {
+      return pool.isEmpty() ? newObject() : pool.removeLast();
+    }
+
+    void restore(T instance) {
+      pool.addLast(instance);
+    }
+
+    protected abstract T newObject();
   }
 }

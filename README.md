@@ -14,6 +14,8 @@ Place a `ScalpelFrameLayout` at the root of your hierarchy.
 
  * Enable the 3D interaction with `setLayerInteractionEnabled(boolean)`.
  * Toggle wireframe display with `setDrawViews(boolean)`.
+ * Toggle view ID display with `setDrawIds(boolean).`
+ * Change the wireframe color with `setChromeColor(int)` and `setChromeShadowColor(int)`.
 
 When interaction is enabled the following gestures are supported:
 
@@ -33,14 +35,14 @@ Download
 
 Download [the latest JAR][1] or grab via Gradle:
 ```groovy
-compile 'com.jakewharton.scalpel:scalpel:1.0.0'
+compile 'com.jakewharton.scalpel:scalpel:1.1.2'
 ```
 or Maven:
 ```xml
 <dependency>
-    <groupId>com.jakewharton.scalpel</groupId>
-    <artifactId>scalpel</artifactId>
-    <version>1.0.0</version>
+  <groupId>com.jakewharton.scalpel</groupId>
+  <artifactId>scalpel</artifactId>
+  <version>1.1.2</version>
 </dependency>
 ```
 
